@@ -1,0 +1,34 @@
+# Core data & computation
+nsepython>=2.9
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Technical analysis
+ta>=0.10.2
+pandas-ta>=0.3.14b
+
+# ML Ensemble (Phase 3)
+scikit-learn>=1.3.0
+xgboost>=1.7.0
+lightgbm>=4.0.0
+
+# Excel dashboard output
+openpyxl>=3.1.0
+xlsxwriter>=3.1.0
+
+# Visualisation
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.14.0
+
+# Utilities
+requests>=2.31.0
+python-dateutil>=2.8.2
+pytz>=2023.3
+tqdm>=4.65.0
+loguru>=0.7.0
+
+# Optional: Bloomberg/Refinitiv (uncomment if available)
+# blpapi
+# refinitiv-data
