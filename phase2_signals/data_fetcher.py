@@ -1,692 +1,737 @@
 """
-phase2_signals/data_fetcher.py
-================================
-Phase 2 — Script 01: Data Fetcher
-India Sector Rotation Strategy
+india-sector-rotation | Phase 2 | Script 01
+============================================
+data_fetcher.py
 
-Fetches daily OHLCV data for all 49 indices in the universe using NSEPython.
-Outputs clean, validated Parquet + CSV files to data/ directory.
+PURPOSE
+-------
+Fetches, validates, caches, and exports historical OHLCV price data for the
+full 49-index universe (47 rotation + 2 reference) from NSE via nsepython.
+Also fetches P/E, P/B, and Dividend Yield for the Valuation Score (Block 4).
 
-Features:
-  - Fetches all 47 rotation indices + 2 reference indices
-  - Configurable lookback (default: 520 trading days ≈ 2 years for signals
-    + buffer; set FULL_HISTORY=True for max history ≈ 2005 onwards)
-  - Handles NSE rate-limiting with exponential backoff
-  - Data quality checks: gaps, outliers, stale data
-  - Incremental refresh: only fetches missing dates on subsequent runs
-  - Saves per-index CSV + combined Parquet master file
+OUTPUTS  (all written to  data/raw/)
+--------------------------------------
+prices_daily.parquet      — Daily OHLCV, multi-index columns: (date, index_name)
+prices_daily.csv          — Same, human-readable CSV copy
+pe_pb_div_monthly.parquet — Monthly P/E, P/B, Div Yield per index
+pe_pb_div_monthly.csv     — Same, CSV copy
+fetch_log.json            — Audit log: success / failed / skipped per index
 
-Usage:
-  python phase2_signals/data_fetcher.py                 # Default: 520 days
-  python phase2_signals/data_fetcher.py --full          # Full history
-  python phase2_signals/data_fetcher.py --index "NIFTY BANK"  # Single index
-  python phase2_signals/data_fetcher.py --refresh       # Force re-fetch all
+USAGE
+------
+  python data_fetcher.py                              # full fetch, default start date
+  python data_fetcher.py --start 2015-01-01           # custom start date
+  python data_fetcher.py --end 2024-12-31             # custom end date
+  python data_fetcher.py --refresh                    # force re-fetch even if cached
+  python data_fetcher.py --indices "NIFTY BANK,NIFTY IT"  # fetch a subset only
+  python data_fetcher.py --no-fundamentals            # skip P/E/P/B/DY fetch
 
-Author: India Sector Rotation Strategy
-Last updated: February 2026
+DEPENDENCIES
+------------
+  pip install nsepython pandas pyarrow tqdm colorama
 """
 
+import argparse
+import json
+import logging
 import os
 import sys
 import time
-import argparse
-import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-import numpy as np
 from tqdm import tqdm
 
-# ── Path setup ────────────────────────────────────────────────────────────────
-ROOT_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT_DIR))
+# ── Optional coloured console output ──────────────────────────────────────────
+try:
+    from colorama import Fore, Style, init as colorama_init
+    colorama_init(autoreset=True)
+    GREEN  = Fore.GREEN
+    YELLOW = Fore.YELLOW
+    RED    = Fore.RED
+    CYAN   = Fore.CYAN
+    RESET  = Style.RESET_ALL
+except ImportError:
+    GREEN = YELLOW = RED = CYAN = RESET = ""
 
-from config.index_universe import ALL_SYMBOLS, ROTATION_SYMBOLS, REFERENCE_SYMBOLS
-
-# ── Logging ──────────────────────────────────────────────────────────────────
-LOG_DIR = ROOT_DIR / "logs"
-LOG_DIR.mkdir(exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_DIR / f"data_fetcher_{datetime.now():%Y%m%d}.log"),
-    ],
-)
-logger = logging.getLogger(__name__)
-
-# ── Data directory ────────────────────────────────────────────────────────────
-DATA_DIR = ROOT_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
-INDEX_DATA_DIR = DATA_DIR / "indices"
-INDEX_DATA_DIR.mkdir(exist_ok=True)
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-DEFAULT_LOOKBACK_DAYS = 520          # ~2 years trading days (252 × 2 + 16 buffer)
-FULL_HISTORY_START   = "01-01-2005"  # NSEPython date format: DD-MM-YYYY
-NSE_RATE_LIMIT_SLEEP = 1.5           # seconds between API calls (be polite)
-MAX_RETRIES          = 3             # retries per failed fetch
-BACKOFF_BASE         = 2             # exponential backoff multiplier
-
-# Outlier thresholds
-MAX_DAILY_RETURN = 0.30              # flag if daily return > 30%
-MIN_DAILY_RETURN = -0.30             # flag if daily return < -30%
-MAX_ZERO_VOLUME_STREAK = 5           # flag if volume = 0 for > 5 consecutive days
+# ── NSEPython ─────────────────────────────────────────────────────────────────
+try:
+    from nsepython import index_history, index_pe_pb_div
+except ImportError:
+    print(f"{RED}ERROR: nsepython not found.  Run:  pip install nsepython{RESET}")
+    sys.exit(1)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# NSEPython wrapper
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _import_nsepython():
-    """Import NSEPython with a helpful error message if not installed."""
-    try:
-        import nsepython  # noqa: F401
-        from nsepython import index_history
-        return index_history
-    except ImportError:
-        logger.error(
-            "NSEPython not found. Install with: pip install nsepython\n"
-            "If you are in a restricted environment, see README for alternatives."
-        )
-        raise
+DEFAULT_START_DATE  = "01-01-2005"   # NSEPython uses DD-MM-YYYY format
+OUTPUT_DIR          = Path("data/raw")
+LOG_DIR             = Path("logs")
+RETRY_ATTEMPTS      = 3
+RETRY_DELAY_SECONDS = 5              # wait between retries
+RATE_LIMIT_SECONDS  = 1.5            # wait between successive NSE calls
 
 
-def fetch_index_ohlcv(
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INDEX UNIVERSE  (47 rotation + 2 reference = 49 total)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Reference indices — used as benchmark in momentum calculations
+REFERENCE_INDICES = [
+    "NIFTY 50",
+    "NIFTY 500",
+]
+
+# --- 14 Core Sectoral Indices -------------------------------------------------
+CORE_SECTORAL = [
+    "NIFTY BANK",
+    "NIFTY AUTO",
+    "NIFTY IT",
+    "NIFTY FMCG",
+    "NIFTY PHARMA",
+    "NIFTY METAL",
+    "NIFTY REALTY",
+    "NIFTY ENERGY",
+    "NIFTY INFRA",
+    "NIFTY MEDIA",
+    "NIFTY FINANCIAL SERVICES",
+    "NIFTY CONSUMER DURABLES",
+    "NIFTY HEALTHCARE INDEX",
+    "NIFTY OIL AND GAS",
+]
+
+# --- 8 Sectoral Variants ------------------------------------------------------
+SECTORAL_VARIANTS = [
+    "NIFTY PSU BANK",
+    "NIFTY PRIVATE BANK",
+    "NIFTY MIDSMALL FINANCIAL SERVICES",
+    "NIFTY TOTAL MARKET",
+    "NIFTY LARGE MIDCAP 250",
+    "NIFTY MIDCAP 150",
+    "NIFTY SMALLCAP 250",
+    "NIFTY MICROCAP 250",
+]
+
+# --- 25 Thematic Indices ------------------------------------------------------
+THEMATIC = [
+    "NIFTY INDIA DEFENCE",
+    "NIFTY INDIA DIGITAL",
+    "NIFTY INDIA MANUFACTURING",
+    "NIFTY INDIA CONSUMPTION",
+    "NIFTY COMMODITIES",
+    "NIFTY CPSE",
+    "NIFTY PSE",
+    "NIFTY MNC",
+    "NIFTY SERV SECTOR",
+    "NIFTY TRANSPORT & LOGISTICS",
+    "NIFTY MOBILITY",
+    "NIFTY TATA GROUP",
+    "NIFTY100 QUALITY 30",
+    "NIFTY ALPHA 50",
+    "NIFTY200 ALPHA 30",
+    "NIFTY500 MULTICAP INDIA LEADING",
+    "NIFTY INDIA CORPORATE GROUP INDEX",
+    "NIFTY CAPITAL MARKETS",
+    "NIFTY HOUSING",
+    "NIFTY NEW INDIA MANUFACTURING",
+    "NIFTY RURAL INDEX",
+    "NIFTY INDIA TOURISM",
+    "NIFTY TECH INDEX",
+    "NIFTY ENVIRONMENT",
+    "NIFTY100 ESG SECTOR LEADERS",
+]
+
+# Full rotation universe
+ROTATION_INDICES = CORE_SECTORAL + SECTORAL_VARIANTS + THEMATIC
+
+# All 49 indices
+ALL_INDICES = REFERENCE_INDICES + ROTATION_INDICES
+
+# Indices for which P/E, P/B, Div Yield are tracked
+# (NSE only publishes fundamentals for major indices; others will be skipped gracefully)
+FUNDAMENTALS_INDICES = REFERENCE_INDICES + CORE_SECTORAL
+
+# Categorisation map for logging / reporting
+CATEGORY_MAP = {}
+for idx in REFERENCE_INDICES:   CATEGORY_MAP[idx] = "Reference"
+for idx in CORE_SECTORAL:        CATEGORY_MAP[idx] = "Core Sectoral"
+for idx in SECTORAL_VARIANTS:    CATEGORY_MAP[idx] = "Sectoral Variant"
+for idx in THEMATIC:             CATEGORY_MAP[idx] = "Thematic"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LOGGING SETUP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def setup_logging(log_dir: Path) -> logging.Logger:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"fetch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-8s | %(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    logger = logging.getLogger("data_fetcher")
+    logger.info(f"Log file: {log_file}")
+    return logger
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DATE HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def to_nse_date(dt: datetime) -> str:
+    """Convert datetime to NSEPython DD-MM-YYYY string."""
+    return dt.strftime("%d-%m-%Y")
+
+
+def from_nse_date(s: str) -> datetime:
+    """Parse NSEPython DD-MM-YYYY string to datetime."""
+    return datetime.strptime(s, "%d-%m-%Y")
+
+
+def parse_input_date(s: str) -> datetime:
+    """Accept YYYY-MM-DD or DD-MM-YYYY from the user CLI."""
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"Cannot parse date: '{s}'. Use YYYY-MM-DD or DD-MM-YYYY.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CACHE HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _cache_path(output_dir: Path, index_name: str, data_type: str) -> Path:
+    safe_name = index_name.replace(" ", "_").replace("&", "AND")
+    return output_dir / "cache" / data_type / f"{safe_name}.parquet"
+
+
+def _load_cached(path: Path) -> pd.DataFrame | None:
+    if path.exists():
+        try:
+            return pd.read_parquet(path)
+        except Exception:
+            return None
+    return None
+
+
+def _save_cache(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FETCH: PRICE HISTORY (OHLCV)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _parse_price_response(raw_df: pd.DataFrame, index_name: str) -> pd.DataFrame:
+    """
+    NSEPython returns columns: HistoricalDate, OPEN, HIGH, LOW, CLOSE, SharesTraded, Turnover.
+    Standardise to: date, open, high, low, close, volume, turnover, index_name.
+    """
+    df = raw_df.copy()
+
+    # Normalise column names
+    df.columns = [c.strip().upper() for c in df.columns]
+
+    rename_map = {
+        "HISTORICALDATE": "date",
+        "OPEN":           "open",
+        "HIGH":           "high",
+        "LOW":            "low",
+        "CLOSE":          "close",
+        "SHARESTRADED":   "volume",
+        "TURNOVER":       "turnover",
+    }
+    df.rename(columns=rename_map, inplace=True)
+
+    # Keep only expected columns (ignore extras)
+    keep = [c for c in ["date", "open", "high", "low", "close", "volume", "turnover"]
+            if c in df.columns]
+    df = df[keep]
+
+    # Parse date
+    df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
+    df.dropna(subset=["date"], inplace=True)
+
+    # Parse numerics (NSE sometimes returns strings with commas)
+    for col in ["open", "high", "low", "close", "volume", "turnover"]:
+        if col in df.columns:
+            df[col] = (
+                df[col].astype(str)
+                       .str.replace(",", "", regex=False)
+                       .pipe(pd.to_numeric, errors="coerce")
+            )
+
+    df.sort_values("date", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    df["index_name"] = index_name
+    return df
+
+
+def fetch_price_history(
     index_name: str,
     start_date: str,
     end_date: str,
-    retries: int = MAX_RETRIES,
+    output_dir: Path,
+    refresh: bool,
+    logger: logging.Logger,
 ) -> pd.DataFrame | None:
     """
-    Fetch OHLCV data for a single NSE index via NSEPython.
-
-    Parameters
-    ----------
-    index_name : str
-        NSE index name exactly as in config/index_universe.py
-        e.g. "NIFTY BANK", "NIFTY IT"
-    start_date : str
-        Format: "DD-MM-YYYY"
-    end_date : str
-        Format: "DD-MM-YYYY"
-    retries : int
-        Number of retry attempts on failure
-
-    Returns
-    -------
-    pd.DataFrame with columns [Date, Open, High, Low, Close, Volume]
-    or None if all retries exhausted.
+    Fetch OHLCV history for one index.
+    Uses cache unless --refresh is set.
+    Implements retry logic with exponential back-off.
+    Returns a clean DataFrame or None on failure.
     """
-    index_history = _import_nsepython()
+    cache_path = _cache_path(output_dir, index_name, "prices")
 
-    for attempt in range(1, retries + 1):
+    # --- Cache hit ---
+    if not refresh:
+        cached = _load_cached(cache_path)
+        if cached is not None:
+            logger.info(f"  [CACHE HIT]  {index_name}")
+            return cached
+
+    # --- Fetch from NSE ---
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            logger.debug(f"Fetching {index_name} | {start_date} → {end_date} (attempt {attempt})")
             raw = index_history(index_name, start_date, end_date)
 
             if raw is None or (isinstance(raw, pd.DataFrame) and raw.empty):
-                logger.warning(f"Empty response for {index_name} on attempt {attempt}")
-                if attempt < retries:
-                    time.sleep(NSE_RATE_LIMIT_SLEEP * attempt)
-                    continue
+                logger.warning(f"  [EMPTY]      {index_name} — no data returned")
                 return None
 
-            df = _normalise_ohlcv(raw, index_name)
+            if isinstance(raw, dict):
+                # nsepython sometimes returns dict with 'data' key
+                if "data" in raw:
+                    raw = pd.DataFrame(raw["data"])
+                else:
+                    logger.warning(f"  [BAD RESP]   {index_name} — unexpected dict structure")
+                    return None
+
+            df = _parse_price_response(raw, index_name)
+
+            if df.empty:
+                logger.warning(f"  [EMPTY]      {index_name} — parsed DataFrame is empty")
+                return None
+
+            _save_cache(df, cache_path)
+            logger.info(
+                f"  [OK]         {index_name} — "
+                f"{len(df):,} rows  "
+                f"({df['date'].min().date()} → {df['date'].max().date()})"
+            )
             return df
 
-        except Exception as e:
-            logger.warning(f"Error fetching {index_name} (attempt {attempt}/{retries}): {e}")
-            if attempt < retries:
-                sleep_time = NSE_RATE_LIMIT_SLEEP * (BACKOFF_BASE ** attempt)
-                logger.info(f"Retrying in {sleep_time:.1f}s...")
-                time.sleep(sleep_time)
-            else:
-                logger.error(f"Failed to fetch {index_name} after {retries} attempts.")
-                return None
+        except Exception as exc:
+            wait = RETRY_DELAY_SECONDS * attempt
+            logger.warning(
+                f"  [RETRY {attempt}/{RETRY_ATTEMPTS}]  {index_name} — {exc}  "
+                f"(waiting {wait}s)"
+            )
+            time.sleep(wait)
 
+    logger.error(f"  [FAILED]     {index_name} — all {RETRY_ATTEMPTS} attempts exhausted")
     return None
 
 
-def _normalise_ohlcv(raw: pd.DataFrame, index_name: str) -> pd.DataFrame:
-    """
-    Standardise NSEPython output into a clean OHLCV DataFrame.
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FETCH: P/E, P/B, DIVIDEND YIELD (FUNDAMENTALS)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    NSEPython column names vary slightly across versions; this function
-    handles the known variants and produces a consistent schema.
+def _parse_fundamental_response(raw_df: pd.DataFrame, index_name: str) -> pd.DataFrame:
     """
-    df = raw.copy()
+    NSEPython index_pe_pb_div returns columns such as:
+      Date, P/E, P/B, Div Yield
+    Standardise to: date, pe, pb, div_yield, index_name.
+    """
+    df = raw_df.copy()
+    df.columns = [c.strip().upper().replace("/", "_").replace(" ", "_")
+                  for c in df.columns]
 
-    # ── Column name normalisation ─────────────────────────────────────────────
-    col_map = {}
+    rename_map = {
+        "DATE":      "date",
+        "P_E":       "pe",
+        "P_B":       "pb",
+        "DIV_YIELD": "div_yield",
+    }
+    # Also handle variants nsepython has used historically
     for col in df.columns:
-        col_lower = col.strip().lower().replace(" ", "_")
-        if col_lower in ("index_date", "date", "HistoricalDate".lower()):
-            col_map[col] = "Date"
-        elif col_lower in ("open", "open_index_value"):
-            col_map[col] = "Open"
-        elif col_lower in ("high", "high_index_value"):
-            col_map[col] = "High"
-        elif col_lower in ("low", "low_index_value"):
-            col_map[col] = "Low"
-        elif col_lower in ("closing_index_value", "close", "closing"):
-            col_map[col] = "Close"
-        elif col_lower in ("volume", "turnover_(rs._cr.)", "turnover_rs_cr"):
-            col_map[col] = "Volume"
-        elif col_lower in ("pe_ratio", "pb_ratio", "div_yield"):
-            # Keep fundamental columns if present — useful for Block 4
-            col_map[col] = col_lower.upper()
+        if "PE" in col or "P_E" in col:
+            rename_map.setdefault(col, "pe")
+        if "PB" in col or "P_B" in col:
+            rename_map.setdefault(col, "pb")
+        if "DIV" in col:
+            rename_map.setdefault(col, "div_yield")
 
-    df.rename(columns=col_map, inplace=True)
+    df.rename(columns=rename_map, inplace=True)
 
-    # Ensure required columns exist
-    required = ["Date", "Open", "High", "Low", "Close"]
-    for col in required:
-        if col not in df.columns:
-            raise ValueError(f"Column '{col}' not found in NSEPython output for {index_name}. "
-                             f"Available: {list(df.columns)}")
+    keep = [c for c in ["date", "pe", "pb", "div_yield"] if c in df.columns]
+    df = df[keep]
 
-    # Add Volume column with NaN if not available (some indices don't report volume)
-    if "Volume" not in df.columns:
-        df["Volume"] = np.nan
+    df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
+    df.dropna(subset=["date"], inplace=True)
 
-    # ── Type conversion ───────────────────────────────────────────────────────
-    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["pe", "pb", "div_yield"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # ── Sort and deduplicate ──────────────────────────────────────────────────
-    df.sort_values("Date", inplace=True)
-    df.drop_duplicates(subset="Date", keep="last", inplace=True)
+    df.sort_values("date", inplace=True)
     df.reset_index(drop=True, inplace=True)
+    df["index_name"] = index_name
 
-    # ── Add index identifier column ───────────────────────────────────────────
-    df.insert(0, "Index", index_name)
-
-    # ── Select final columns ──────────────────────────────────────────────────
-    keep_cols = ["Index", "Date", "Open", "High", "Low", "Close", "Volume"]
-    # Preserve fundamental columns if present
-    extra_cols = [c for c in df.columns if c in ("PE_RATIO", "PB_RATIO", "DIV_YIELD")]
-    df = df[keep_cols + extra_cols]
+    # Resample to month-end (keep last observation of each month)
+    df.set_index("date", inplace=True)
+    df = df.resample("ME").last()
+    df.reset_index(inplace=True)
+    df["index_name"] = index_name  # resample drops it
 
     return df
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Data Quality Checks
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run_quality_checks(df: pd.DataFrame, index_name: str) -> dict:
-    """
-    Run data quality checks on a fetched OHLCV DataFrame.
-
-    Returns a dict with check results and a boolean 'passed' flag.
-    Warnings are logged; only critical failures set passed=False.
-    """
-    issues = []
-    warnings = []
-
-    if df is None or df.empty:
-        return {"passed": False, "issues": ["Empty DataFrame"], "warnings": []}
-
-    close = df["Close"].dropna()
-
-    # 1. Minimum row count
-    if len(df) < 20:
-        issues.append(f"Only {len(df)} rows — too few for signal computation (min 20)")
-
-    # 2. Missing Close values
-    missing_close = df["Close"].isna().sum()
-    if missing_close > 0:
-        pct = missing_close / len(df) * 100
-        if pct > 10:
-            issues.append(f"{missing_close} missing Close values ({pct:.1f}%) — exceeds 10% threshold")
-        else:
-            warnings.append(f"{missing_close} missing Close values ({pct:.1f}%) — will forward-fill")
-
-    # 3. Extreme daily returns (potential data errors)
-    if len(close) > 1:
-        daily_returns = close.pct_change().dropna()
-        outliers = daily_returns[(daily_returns > MAX_DAILY_RETURN) | (daily_returns < MIN_DAILY_RETURN)]
-        if not outliers.empty:
-            warnings.append(
-                f"{len(outliers)} extreme daily return(s) detected (|return| > 30%): "
-                f"{outliers.index.tolist()[:5]}"
-            )
-
-    # 4. Zero volume streak
-    if "Volume" in df.columns and df["Volume"].notna().any():
-        volume = df["Volume"].fillna(0)
-        zero_streak = _max_consecutive_zeros(volume)
-        if zero_streak > MAX_ZERO_VOLUME_STREAK:
-            warnings.append(f"Volume = 0 for {zero_streak} consecutive days — possible data gap")
-
-    # 5. High < Low check
-    invalid_hl = df[df["High"] < df["Low"]]
-    if not invalid_hl.empty:
-        issues.append(f"{len(invalid_hl)} rows where High < Low — data corruption")
-
-    # 6. Stale data (last date more than 5 trading days ago)
-    if not df.empty:
-        last_date = df["Date"].max()
-        days_since = (datetime.now() - last_date).days
-        if days_since > 7:
-            warnings.append(f"Last data point is {days_since} days ago ({last_date.date()}) — may be stale")
-
-    passed = len(issues) == 0
-    for w in warnings:
-        logger.warning(f"  ⚠  {index_name}: {w}")
-    for i in issues:
-        logger.error(f"  ✗  {index_name}: {i}")
-    if passed and not warnings:
-        logger.debug(f"  ✓  {index_name}: All quality checks passed")
-
-    return {"passed": passed, "issues": issues, "warnings": warnings}
-
-
-def _max_consecutive_zeros(series: pd.Series) -> int:
-    """Return the maximum consecutive run of zeros in a Series."""
-    max_streak = streak = 0
-    for val in series:
-        if val == 0:
-            streak += 1
-            max_streak = max(max_streak, streak)
-        else:
-            streak = 0
-    return max_streak
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Incremental refresh logic
-# ══════════════════════════════════════════════════════════════════════════════
-
-def get_existing_data(index_name: str) -> pd.DataFrame | None:
-    """Load existing CSV for an index if it exists."""
-    safe_name = index_name.replace(" ", "_").replace("&", "AND").replace("/", "_")
-    csv_path = INDEX_DATA_DIR / f"{safe_name}.csv"
-    if csv_path.exists():
-        try:
-            df = pd.read_csv(csv_path, parse_dates=["Date"])
-            return df
-        except Exception as e:
-            logger.warning(f"Could not read existing data for {index_name}: {e}")
-    return None
-
-
-def get_incremental_start_date(existing_df: pd.DataFrame | None) -> str:
-    """
-    If existing data is present, return the day after the last available date.
-    Otherwise return the default lookback start date.
-    """
-    if existing_df is not None and not existing_df.empty:
-        last_date = existing_df["Date"].max()
-        next_date = last_date + timedelta(days=1)
-        return next_date.strftime("%d-%m-%Y")
-    return None
-
-
-def merge_with_existing(new_df: pd.DataFrame, existing_df: pd.DataFrame | None) -> pd.DataFrame:
-    """Merge newly fetched data with existing data, deduplicating on Date."""
-    if existing_df is None or existing_df.empty:
-        return new_df
-    combined = pd.concat([existing_df, new_df], ignore_index=True)
-    combined["Date"] = pd.to_datetime(combined["Date"])
-    combined.sort_values("Date", inplace=True)
-    combined.drop_duplicates(subset="Date", keep="last", inplace=True)
-    combined.reset_index(drop=True, inplace=True)
-    return combined
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Save functions
-# ══════════════════════════════════════════════════════════════════════════════
-
-def save_index_csv(df: pd.DataFrame, index_name: str) -> Path:
-    """Save per-index CSV to data/indices/."""
-    safe_name = index_name.replace(" ", "_").replace("&", "AND").replace("/", "_")
-    csv_path = INDEX_DATA_DIR / f"{safe_name}.csv"
-    df.to_csv(csv_path, index=False)
-    logger.debug(f"Saved: {csv_path}")
-    return csv_path
-
-
-def save_master_parquet(all_dfs: dict[str, pd.DataFrame]) -> Path:
-    """
-    Combine all index DataFrames into a single master Parquet file.
-    Long format: Index | Date | Open | High | Low | Close | Volume
-    """
-    if not all_dfs:
-        logger.warning("No data to save to master Parquet.")
-        return None
-
-    master_df = pd.concat(all_dfs.values(), ignore_index=True)
-    master_df["Date"] = pd.to_datetime(master_df["Date"])
-    master_df.sort_values(["Index", "Date"], inplace=True)
-    master_df.reset_index(drop=True, inplace=True)
-
-    parquet_path = DATA_DIR / "master_ohlcv.parquet"
-    master_df.to_parquet(parquet_path, index=False, engine="pyarrow")
-    logger.info(f"Master Parquet saved: {parquet_path} ({len(master_df):,} rows, {master_df['Index'].nunique()} indices)")
-    return parquet_path
-
-
-def save_master_csv(all_dfs: dict[str, pd.DataFrame]) -> Path:
-    """Save combined master CSV (fallback if Parquet unavailable)."""
-    if not all_dfs:
-        return None
-    master_df = pd.concat(all_dfs.values(), ignore_index=True)
-    master_df["Date"] = pd.to_datetime(master_df["Date"])
-    master_df.sort_values(["Index", "Date"], inplace=True)
-    master_df.reset_index(drop=True, inplace=True)
-
-    csv_path = DATA_DIR / "master_ohlcv.csv"
-    master_df.to_csv(csv_path, index=False)
-    logger.info(f"Master CSV saved: {csv_path} ({len(master_df):,} rows)")
-    return csv_path
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Main fetch orchestrator
-# ══════════════════════════════════════════════════════════════════════════════
-
-def compute_date_range(full_history: bool, lookback_days: int) -> tuple[str, str]:
-    """Compute start and end date strings in DD-MM-YYYY format."""
-    end_dt = datetime.now()
-    if full_history:
-        start_str = FULL_HISTORY_START
-    else:
-        start_dt = end_dt - timedelta(days=lookback_days * 1.5)  # 1.5× buffer for weekends/holidays
-        start_str = start_dt.strftime("%d-%m-%Y")
-    end_str = end_dt.strftime("%d-%m-%Y")
-    return start_str, end_str
-
-
-def fetch_all(
-    symbols: list[str],
+def fetch_fundamentals(
+    index_name: str,
     start_date: str,
     end_date: str,
-    incremental: bool = True,
-    force_refresh: bool = False,
-) -> dict[str, pd.DataFrame]:
+    output_dir: Path,
+    refresh: bool,
+    logger: logging.Logger,
+) -> pd.DataFrame | None:
     """
-    Fetch OHLCV data for all symbols in the list.
-
-    Parameters
-    ----------
-    symbols      : list of index name strings
-    start_date   : default start date (DD-MM-YYYY)
-    end_date     : end date (DD-MM-YYYY)
-    incremental  : if True, only fetch missing dates
-    force_refresh: if True, re-fetch all data from scratch
-
-    Returns
-    -------
-    Dict mapping index_name → clean OHLCV DataFrame
+    Fetch P/E, P/B, Div Yield for one index.
+    Month-end resampled. Returns None gracefully if NSE doesn't publish for that index.
     """
-    results = {}
-    failed = []
-    skipped = []
+    cache_path = _cache_path(output_dir, index_name, "fundamentals")
 
-    logger.info(f"Starting fetch for {len(symbols)} indices")
-    logger.info(f"Date range: {start_date} → {end_date}")
-    logger.info(f"Mode: {'FULL REFRESH' if force_refresh else 'INCREMENTAL' if incremental else 'STANDARD'}")
+    if not refresh:
+        cached = _load_cached(cache_path)
+        if cached is not None:
+            logger.info(f"  [CACHE HIT]  {index_name} (fundamentals)")
+            return cached
 
-    for symbol in tqdm(symbols, desc="Fetching indices", unit="index"):
-        time.sleep(NSE_RATE_LIMIT_SLEEP)  # Rate limit: polite to NSE
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            raw = index_pe_pb_div(index_name, start_date, end_date)
 
-        # Load existing data
-        existing_df = None if force_refresh else get_existing_data(symbol)
+            if raw is None or (isinstance(raw, pd.DataFrame) and raw.empty):
+                logger.warning(f"  [EMPTY]      {index_name} fundamentals — no data")
+                return None
 
-        # Determine fetch start date
-        if incremental and existing_df is not None and not force_refresh:
-            fetch_start = get_incremental_start_date(existing_df)
-            if fetch_start is None:
-                logger.info(f"  ↷ {symbol}: Up to date — skipping")
-                results[symbol] = existing_df
-                skipped.append(symbol)
-                continue
+            if isinstance(raw, dict):
+                if "data" in raw:
+                    raw = pd.DataFrame(raw["data"])
+                else:
+                    return None
 
-            # Check if incremental start is after today
-            fetch_start_dt = datetime.strptime(fetch_start, "%d-%m-%Y")
-            end_dt = datetime.strptime(end_date, "%d-%m-%Y")
-            if fetch_start_dt > end_dt:
-                logger.info(f"  ↷ {symbol}: Already current (last: {fetch_start}) — skipping")
-                results[symbol] = existing_df
-                skipped.append(symbol)
-                continue
+            df = _parse_fundamental_response(raw, index_name)
+            _save_cache(df, cache_path)
+            logger.info(
+                f"  [OK]         {index_name} fundamentals — "
+                f"{len(df)} months "
+                f"({df['date'].min().date()} → {df['date'].max().date()})"
+            )
+            return df
 
-            logger.info(f"  ↻ {symbol}: Incremental fetch from {fetch_start}")
-            effective_start = fetch_start
-        else:
-            effective_start = start_date
+        except Exception as exc:
+            wait = RETRY_DELAY_SECONDS * attempt
+            logger.warning(
+                f"  [RETRY {attempt}/{RETRY_ATTEMPTS}]  {index_name} fundamentals — {exc}  "
+                f"(waiting {wait}s)"
+            )
+            time.sleep(wait)
 
-        # Fetch from NSE
-        df = fetch_index_ohlcv(symbol, effective_start, end_date)
-
-        if df is None:
-            logger.error(f"  ✗ {symbol}: Fetch failed — skipped")
-            failed.append(symbol)
-            # Keep existing data if available
-            if existing_df is not None:
-                results[symbol] = existing_df
-            continue
-
-        # Merge with existing
-        if incremental and existing_df is not None and not force_refresh:
-            df = merge_with_existing(df, existing_df)
-
-        # Quality checks
-        qc = run_quality_checks(df, symbol)
-        if not qc["passed"]:
-            logger.error(f"  ✗ {symbol}: Failed quality checks — {qc['issues']}")
-            failed.append(symbol)
-            # Still save what we have (degraded data is better than none)
-
-        # Forward-fill missing Close values (minor gaps only)
-        df["Close"] = df["Close"].ffill()
-        df["Open"]  = df["Open"].ffill()
-        df["High"]  = df["High"].ffill()
-        df["Low"]   = df["Low"].ffill()
-
-        # Save per-index CSV
-        save_index_csv(df, symbol)
-        results[symbol] = df
-
-        rows = len(df)
-        date_range = f"{df['Date'].min().date()} → {df['Date'].max().date()}"
-        logger.info(f"  ✓ {symbol}: {rows:,} rows | {date_range}")
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    logger.info("─" * 60)
-    logger.info(f"Fetch complete:")
-    logger.info(f"  ✓ Successful : {len(results) - len(failed)} indices")
-    logger.info(f"  ↷ Skipped    : {len(skipped)} indices (already current)")
-    logger.info(f"  ✗ Failed     : {len(failed)} indices")
-    if failed:
-        logger.warning(f"  Failed indices: {failed}")
-
-    return results
+    logger.error(f"  [FAILED]     {index_name} fundamentals — all retries exhausted")
+    return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Diagnostic helpers
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DATA VALIDATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def print_fetch_summary(all_dfs: dict[str, pd.DataFrame]) -> None:
-    """Print a formatted summary table of all fetched indices."""
-    if not all_dfs:
-        print("No data fetched.")
-        return
-
-    print("\n" + "═" * 75)
-    print(f"{'INDEX':<45} {'ROWS':>7} {'FROM':>12} {'TO':>12}")
-    print("─" * 75)
-
-    total_rows = 0
-    for index_name, df in sorted(all_dfs.items()):
-        rows = len(df)
-        total_rows += rows
-        if not df.empty and "Date" in df.columns:
-            date_from = df["Date"].min().strftime("%d-%m-%Y")
-            date_to   = df["Date"].max().strftime("%d-%m-%Y")
-        else:
-            date_from = date_to = "N/A"
-        print(f"{index_name:<45} {rows:>7,} {date_from:>12} {date_to:>12}")
-
-    print("─" * 75)
-    print(f"{'TOTAL':>45} {total_rows:>7,}")
-    print("═" * 75 + "\n")
-
-
-def load_master_parquet() -> pd.DataFrame:
-    """Load the master OHLCV Parquet file."""
-    parquet_path = DATA_DIR / "master_ohlcv.parquet"
-    if not parquet_path.exists():
-        raise FileNotFoundError(
-            f"Master Parquet not found at {parquet_path}. "
-            "Run data_fetcher.py first."
-        )
-    df = pd.read_parquet(parquet_path)
-    df["Date"] = pd.to_datetime(df["Date"])
-    return df
-
-
-def get_close_prices_wide(min_date: str = None) -> pd.DataFrame:
+def validate_price_data(df: pd.DataFrame, index_name: str, logger: logging.Logger) -> dict:
     """
-    Return a wide-format DataFrame of Close prices.
-    Columns = index names, Rows = dates.
-    Convenient for signal computation scripts.
-
-    Parameters
-    ----------
-    min_date : str, optional
-        Filter to dates >= min_date (format: YYYY-MM-DD)
+    Run quality checks on a fetched price DataFrame.
+    Returns a dict of validation results.
     """
-    master = load_master_parquet()
-    wide = master.pivot_table(index="Date", columns="Index", values="Close")
-    wide.sort_index(inplace=True)
-    if min_date:
-        wide = wide[wide.index >= pd.Timestamp(min_date)]
-    return wide
+    issues = []
+
+    # 1. Missing close prices
+    null_close = df["close"].isna().sum()
+    if null_close > 0:
+        issues.append(f"{null_close} null close prices")
+
+    # 2. Zero or negative close
+    bad_price = (df["close"] <= 0).sum()
+    if bad_price > 0:
+        issues.append(f"{bad_price} zero/negative close prices")
+
+    # 3. Duplicate dates
+    dup_dates = df["date"].duplicated().sum()
+    if dup_dates > 0:
+        issues.append(f"{dup_dates} duplicate dates")
+
+    # 4. Suspicious price gaps (>30% single-day change — likely data error)
+    pct_change = df["close"].pct_change().abs()
+    big_jumps = (pct_change > 0.30).sum()
+    if big_jumps > 0:
+        issues.append(f"{big_jumps} single-day price moves >30%")
+
+    # 5. Data freshness — warn if latest date is >10 calendar days ago
+    latest = df["date"].max()
+    staleness = (datetime.now() - latest).days
+    if staleness > 10:
+        issues.append(f"data may be stale — latest date: {latest.date()} ({staleness} days ago)")
+
+    status = "WARN" if issues else "OK"
+    return {
+        "index":    index_name,
+        "rows":     len(df),
+        "start":    str(df["date"].min().date()),
+        "end":      str(df["date"].max().date()),
+        "status":   status,
+        "issues":   issues,
+    }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CLI entry point
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ASSEMBLY: COMBINE ALL FETCHED DATA
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="India Sector Rotation — Data Fetcher (Phase 2, Script 01)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python data_fetcher.py                        # Default 520-day fetch, incremental
-  python data_fetcher.py --full                 # Full history from Jan 2005
-  python data_fetcher.py --refresh              # Force re-fetch all data
-  python data_fetcher.py --index "NIFTY BANK"   # Single index
-  python data_fetcher.py --rotation-only        # Skip thematic indices
-        """,
-    )
-    parser.add_argument(
-        "--full",
-        action="store_true",
-        help=f"Fetch full history from {FULL_HISTORY_START} (slow — ~5-10 min)",
-    )
-    parser.add_argument(
-        "--refresh",
-        action="store_true",
-        help="Force re-fetch all data (ignore existing files)",
-    )
-    parser.add_argument(
-        "--lookback",
-        type=int,
-        default=DEFAULT_LOOKBACK_DAYS,
-        help=f"Lookback in trading days (default: {DEFAULT_LOOKBACK_DAYS})",
-    )
-    parser.add_argument(
-        "--index",
-        type=str,
-        default=None,
-        help='Fetch a single index only (e.g. "NIFTY BANK")',
-    )
-    parser.add_argument(
-        "--rotation-only",
-        action="store_true",
-        help="Fetch only rotation indices (skip reference indices)",
-    )
-    parser.add_argument(
-        "--no-parquet",
-        action="store_true",
-        help="Skip saving master Parquet (save CSV only)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print what would be fetched without making API calls",
-    )
-    return parser.parse_args()
+def assemble_price_panel(dfs: list[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Stack all individual index DataFrames into a single panel:
+    columns: date, index_name, open, high, low, close, volume, turnover
+    Sorted by (date, index_name).
+    """
+    panel = pd.concat(dfs, ignore_index=True)
+    panel.sort_values(["date", "index_name"], inplace=True)
+    panel.reset_index(drop=True, inplace=True)
+    return panel
 
+
+def assemble_fundamental_panel(dfs: list[pd.DataFrame]) -> pd.DataFrame:
+    panel = pd.concat(dfs, ignore_index=True)
+    panel.sort_values(["date", "index_name"], inplace=True)
+    panel.reset_index(drop=True, inplace=True)
+    return panel
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  EXPORT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def export_data(df: pd.DataFrame, output_dir: Path, base_name: str, logger: logging.Logger) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    parquet_path = output_dir / f"{base_name}.parquet"
+    csv_path     = output_dir / f"{base_name}.csv"
+
+    df.to_parquet(parquet_path, index=False)
+    df.to_csv(csv_path, index=False)
+
+    logger.info(f"  Saved: {parquet_path}  ({len(df):,} rows)")
+    logger.info(f"  Saved: {csv_path}")
+
+
+def export_fetch_log(log_data: dict, output_dir: Path, logger: logging.Logger) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "fetch_log.json"
+    with open(log_path, "w") as f:
+        json.dump(log_data, f, indent=2, default=str)
+    logger.info(f"  Saved: {log_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SUMMARY REPORT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def print_summary(fetch_log: dict) -> None:
+    price_results = fetch_log.get("prices", {})
+    total     = len(price_results)
+    succeeded = sum(1 for v in price_results.values() if v["status"] in ("OK", "WARN"))
+    failed    = sum(1 for v in price_results.values() if v["status"] == "FAILED")
+    warned    = sum(1 for v in price_results.values() if v["status"] == "WARN")
+
+    print(f"\n{'═'*60}")
+    print(f"  DATA FETCH SUMMARY")
+    print(f"{'═'*60}")
+    print(f"  Total indices requested : {total}")
+    print(f"  {GREEN}Successfully fetched    : {succeeded}{RESET}")
+    print(f"  {YELLOW}With warnings           : {warned}{RESET}")
+    print(f"  {RED}Failed                  : {failed}{RESET}")
+
+    if failed > 0:
+        print(f"\n  {RED}FAILED indices:{RESET}")
+        for name, result in price_results.items():
+            if result["status"] == "FAILED":
+                print(f"    - {name}")
+
+    if warned > 0:
+        print(f"\n  {YELLOW}WARNING indices:{RESET}")
+        for name, result in price_results.items():
+            if result["status"] == "WARN":
+                print(f"    - {name}: {'; '.join(result.get('issues', []))}")
+
+    print(f"{'═'*60}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN ORCHESTRATOR
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    args = parse_args()
-
-    logger.info("═" * 60)
-    logger.info("India Sector Rotation — Data Fetcher v1.0")
-    logger.info(f"Run time: {datetime.now():%Y-%m-%d %H:%M:%S IST}")
-    logger.info("═" * 60)
-
-    # Determine symbol list
-    if args.index:
-        symbols = [args.index]
-        logger.info(f"Single-index mode: {args.index}")
-    elif args.rotation_only:
-        symbols = ROTATION_SYMBOLS
-        logger.info(f"Rotation-only mode: {len(symbols)} indices")
-    else:
-        symbols = ALL_SYMBOLS
-        logger.info(f"Full universe mode: {len(symbols)} indices")
-
-    # Compute date range
-    start_date, end_date = compute_date_range(args.full, args.lookback)
-
-    if args.dry_run:
-        logger.info("[DRY RUN] Would fetch the following:")
-        for s in symbols:
-            existing = get_existing_data(s)
-            status = f"EXISTS ({len(existing)} rows)" if existing is not None else "NEW"
-            print(f"  {s:<50} {status}")
-        logger.info(f"Date range: {start_date} → {end_date}")
-        return
-
-    # Run fetch
-    all_dfs = fetch_all(
-        symbols=symbols,
-        start_date=start_date,
-        end_date=end_date,
-        incremental=not args.refresh,
-        force_refresh=args.refresh,
+    # ── CLI Arguments ──────────────────────────────────────────────────────────
+    parser = argparse.ArgumentParser(
+        description="Fetch NSE index price and fundamental data for the sector rotation model."
     )
+    parser.add_argument(
+        "--start", default=DEFAULT_START_DATE,
+        help=f"Start date (YYYY-MM-DD or DD-MM-YYYY). Default: {DEFAULT_START_DATE}",
+    )
+    parser.add_argument(
+        "--end", default=to_nse_date(datetime.today()),
+        help="End date (YYYY-MM-DD or DD-MM-YYYY). Default: today",
+    )
+    parser.add_argument(
+        "--refresh", action="store_true",
+        help="Ignore cache and re-fetch all data from NSE",
+    )
+    parser.add_argument(
+        "--indices", default=None,
+        help='Comma-separated list of index names to fetch (subset mode). '
+             'E.g. "NIFTY BANK,NIFTY IT"',
+    )
+    parser.add_argument(
+        "--no-fundamentals", action="store_true",
+        help="Skip fetching P/E, P/B, Dividend Yield (price data only)",
+    )
+    parser.add_argument(
+        "--output-dir", default=str(OUTPUT_DIR),
+        help=f"Directory to write output files. Default: {OUTPUT_DIR}",
+    )
+    args = parser.parse_args()
 
-    # Print summary
-    print_fetch_summary(all_dfs)
+    # ── Setup ──────────────────────────────────────────────────────────────────
+    logger     = setup_logging(LOG_DIR)
+    output_dir = Path(args.output_dir)
 
-    # Save master files
-    if all_dfs:
-        if not args.no_parquet:
-            try:
-                save_master_parquet(all_dfs)
-            except ImportError:
-                logger.warning("pyarrow not installed — falling back to CSV master")
-                save_master_csv(all_dfs)
+    # Parse and convert dates to NSEPython format
+    start_dt = parse_input_date(args.start)
+    end_dt   = parse_input_date(args.end)
+    start_nse = to_nse_date(start_dt)
+    end_nse   = to_nse_date(end_dt)
+
+    # Determine which indices to fetch
+    if args.indices:
+        indices_to_fetch = [i.strip().upper() for i in args.indices.split(",")]
+        logger.info(f"Subset mode: fetching {len(indices_to_fetch)} indices")
+    else:
+        indices_to_fetch = ALL_INDICES
+        logger.info(f"Full universe mode: fetching {len(indices_to_fetch)} indices")
+
+    logger.info(f"Date range: {start_nse} → {end_nse}")
+    logger.info(f"Refresh cache: {args.refresh}")
+
+    # ── Fetch Price History ────────────────────────────────────────────────────
+    print(f"\n{CYAN}{'─'*60}")
+    print(f"  PHASE 1 OF 2 — PRICE HISTORY (OHLCV)")
+    print(f"{'─'*60}{RESET}")
+
+    price_dfs   = []
+    fetch_log   = {"run_timestamp": str(datetime.now()), "prices": {}, "fundamentals": {}}
+    validation_results = []
+
+    for index_name in tqdm(indices_to_fetch, desc="Fetching prices", unit="index"):
+        df = fetch_price_history(
+            index_name, start_nse, end_nse, output_dir, args.refresh, logger
+        )
+
+        if df is not None:
+            val = validate_price_data(df, index_name, logger)
+            validation_results.append(val)
+            fetch_log["prices"][index_name] = {
+                "category": CATEGORY_MAP.get(index_name, "Unknown"),
+                "status":   val["status"],
+                "rows":     val["rows"],
+                "start":    val["start"],
+                "end":      val["end"],
+                "issues":   val["issues"],
+            }
+            price_dfs.append(df)
         else:
-            save_master_csv(all_dfs)
+            fetch_log["prices"][index_name] = {
+                "category": CATEGORY_MAP.get(index_name, "Unknown"),
+                "status":   "FAILED",
+                "rows":     0,
+                "issues":   ["fetch returned None"],
+            }
 
-    logger.info("Data fetch complete. Ready for signal computation.")
-    logger.info("Next: python phase2_signals/momentum_score.py")
+        time.sleep(RATE_LIMIT_SECONDS)
 
+    # ── Fetch Fundamentals ─────────────────────────────────────────────────────
+    if not args.no_fundamentals:
+        print(f"\n{CYAN}{'─'*60}")
+        print(f"  PHASE 2 OF 2 — FUNDAMENTALS (P/E, P/B, DIV YIELD)")
+        print(f"{'─'*60}{RESET}")
+
+        fund_indices = [i for i in FUNDAMENTALS_INDICES if i in indices_to_fetch]
+        fund_dfs = []
+
+        for index_name in tqdm(fund_indices, desc="Fetching fundamentals", unit="index"):
+            df = fetch_fundamentals(
+                index_name, start_nse, end_nse, output_dir, args.refresh, logger
+            )
+            if df is not None:
+                fund_dfs.append(df)
+                fetch_log["fundamentals"][index_name] = {
+                    "status": "OK",
+                    "months": len(df),
+                }
+            else:
+                fetch_log["fundamentals"][index_name] = {
+                    "status": "FAILED",
+                    "months": 0,
+                }
+            time.sleep(RATE_LIMIT_SECONDS)
+
+    # ── Assemble & Export ──────────────────────────────────────────────────────
+    print(f"\n{CYAN}{'─'*60}")
+    print(f"  EXPORTING DATA")
+    print(f"{'─'*60}{RESET}")
+
+    if price_dfs:
+        price_panel = assemble_price_panel(price_dfs)
+        export_data(price_panel, output_dir, "prices_daily", logger)
+    else:
+        logger.error("No price data fetched — prices_daily not written.")
+
+    if not args.no_fundamentals and fund_dfs:
+        fund_panel = assemble_fundamental_panel(fund_dfs)
+        export_data(fund_panel, output_dir, "pe_pb_div_monthly", logger)
+    elif not args.no_fundamentals:
+        logger.warning("No fundamental data fetched — pe_pb_div_monthly not written.")
+
+    export_fetch_log(fetch_log, output_dir, logger)
+
+    # ── Print Summary ──────────────────────────────────────────────────────────
+    print_summary(fetch_log)
+
+    # Exit with non-zero code if any index failed (useful for CI/scheduling)
+    failed_count = sum(
+        1 for v in fetch_log["prices"].values() if v["status"] == "FAILED"
+    )
+    sys.exit(1 if failed_count == len(indices_to_fetch) else 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     main()

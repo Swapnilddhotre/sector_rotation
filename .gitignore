@@ -46,3 +46,8 @@ Thumbs.db
 
 # NSEPython cache
 nsetools_cache/
+
+# Claude Code internal files
+.claude/
+
+config/sheets_credentials.json
