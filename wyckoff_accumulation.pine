@@ -1,0 +1,228 @@
+//@version=5
+indicator("Wyckoff Accumulation Events", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ─── Inputs ───────────────────────────────────────────────────────────────────
+lookback       = input.int(20,  "Pivot Lookback",          minval=5,  maxval=50)
+volMult        = input.float(1.5, "Volume Spike Multiplier", minval=1.0, step=0.1)
+volLen         = input.int(20,  "Volume MA Length",         minval=5,  maxval=50)
+rangeBuffer    = input.float(0.02, "Range Buffer (% of price)", minval=0.001, step=0.001)
+showLines      = input.bool(true, "Show Support/Resistance Lines")
+showLabels     = input.bool(true, "Show Event Labels")
+
+// ─── Colours ──────────────────────────────────────────────────────────────────
+c_ps  = color.new(color.orange,  0)
+c_sc  = color.new(color.red,     0)
+c_ar  = color.new(color.lime,    0)
+c_st  = color.new(color.yellow,  0)
+c_sp  = color.new(color.purple,  0)
+c_lps = color.new(color.aqua,    0)
+c_sos = color.new(color.green,   0)
+c_bu  = color.new(color.blue,    0)
+c_mu  = color.new(color.white,   0)
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+volMA   = ta.sma(volume, volLen)
+isVolSpike = volume > volMA * volMult
+isWideBar  = (high - low) > ta.atr(14) * 1.5
+
+pivotHi = ta.pivothigh(high, lookback, lookback)
+pivotLo = ta.pivotlow(low,  lookback, lookback)
+
+// Track key levels (updated on pivot confirmation)
+var float scLevel  = na   // Selling Climax low
+var float arLevel  = na   // Automatic Rally high
+var float stLevel  = na   // Secondary Test level
+var float creekLevel = na // Creek = AR high (resistance)
+
+// ─── Phase detection state machine ────────────────────────────────────────────
+// 0=watching  1=PS seen  2=SC seen  3=AR seen  4=ST seen  5=Spring  6=LPS  7=SOS  8=BU  9=Markup
+var int phase = 0
+
+var bool ps_done  = false
+var bool sc_done  = false
+var bool ar_done  = false
+var bool st_done  = false
+var bool sp_done  = false
+var bool lps_done = false
+var bool sos_done = false
+var bool bu_done  = false
+var bool mu_done  = false
+
+// Helper: price within buffer of a level
+inRange(p, lvl, buf) =>
+    not na(lvl) and math.abs(p - lvl) / lvl <= buf
+
+// ─── PS — Preliminary Support ────────────────────────────────────────────────
+// First pivot low after a prolonged downtrend, accompanied by increased volume
+psCondition = phase == 0 and not na(pivotLo) and isVolSpike and close < close[lookback * 3]
+
+if psCondition and not ps_done
+    ps_done := true
+    phase   := 1
+    scLevel := low[lookback]
+    if showLabels
+        label.new(bar_index[lookback], low[lookback], "PS",
+                  color=c_ps, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+// ─── SC — Selling Climax ─────────────────────────────────────────────────────
+// Panic bar: very wide range, huge volume, closes near high (buyers absorb)
+scCondition = phase == 1 and not na(pivotLo) and isVolSpike and isWideBar and
+              (close - low[lookback]) / (high[lookback] - low[lookback] + 0.0001) > 0.4
+
+if scCondition and not sc_done
+    sc_done  := true
+    phase    := 2
+    scLevel  := low[lookback]
+    if showLabels
+        label.new(bar_index[lookback], low[lookback], "SC",
+                  color=c_sc, textcolor=color.white, style=label.style_label_up, size=size.normal)
+    if showLines
+        line.new(bar_index[lookback], low[lookback], bar_index[lookback] + 60, low[lookback],
+                 color=color.new(c_sc, 50), style=line.style_dashed, width=1)
+
+// ─── AR — Automatic Rally ────────────────────────────────────────────────────
+// Sharp bounce after SC on declining volume
+arCondition = phase == 2 and not na(pivotHi) and
+              high[lookback] > scLevel * (1 + rangeBuffer * 5) and
+              volume[lookback] < volume[lookback * 2]
+
+if arCondition and not ar_done
+    ar_done    := true
+    phase      := 3
+    arLevel    := high[lookback]
+    creekLevel := high[lookback]
+    if showLabels
+        label.new(bar_index[lookback], high[lookback], "AR",
+                  color=c_ar, textcolor=color.black, style=label.style_label_down, size=size.normal)
+    if showLines
+        line.new(bar_index[lookback], high[lookback], bar_index[lookback] + 60, high[lookback],
+                 color=color.new(c_ar, 50), style=line.style_dashed, width=1)
+
+// ─── ST — Secondary Test ─────────────────────────────────────────────────────
+// Retest of SC area on lower volume — confirms support
+stCondition = phase == 3 and not na(pivotLo) and
+              inRange(low[lookback], scLevel, rangeBuffer * 3) and
+              volume[lookback] < volMA[lookback]
+
+if stCondition and not st_done
+    st_done  := true
+    phase    := 4
+    stLevel  := low[lookback]
+    if showLabels
+        label.new(bar_index[lookback], low[lookback], "ST",
+                  color=c_st, textcolor=color.black, style=label.style_label_up, size=size.small)
+
+// ─── Spring / Shakeout ───────────────────────────────────────────────────────
+// Brief dip below SC/ST support on low volume, quickly reverses
+springCondition = phase == 4 and not na(pivotLo) and
+                  low[lookback] < scLevel and
+                  close[lookback] > scLevel and
+                  volume[lookback] < volMA[lookback] * 1.2
+
+if springCondition and not sp_done
+    sp_done := true
+    phase   := 5
+    if showLabels
+        label.new(bar_index[lookback], low[lookback], "Spring",
+                  color=c_sp, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+// ─── LPS — Last Point of Support ─────────────────────────────────────────────
+// Higher low after Spring; holds above SC/ST zone
+lpsCondition = (phase == 4 or phase == 5) and not na(pivotLo) and
+               low[lookback] > scLevel and
+               (na(stLevel) or low[lookback] >= stLevel * (1 - rangeBuffer)) and
+               volume[lookback] < volMA[lookback]
+
+if lpsCondition and not lps_done
+    lps_done := true
+    phase    := 6
+    if showLabels
+        label.new(bar_index[lookback], low[lookback], "LPS",
+                  color=c_lps, textcolor=color.black, style=label.style_label_up, size=size.small)
+
+// ─── SOS — Sign of Strength ──────────────────────────────────────────────────
+// Strong advance on increasing volume, breaks above creek (AR high)
+sosCondition = phase == 6 and not na(pivotHi) and
+               high[lookback] > creekLevel and
+               isVolSpike and
+               close[lookback] > open[lookback]
+
+if sosCondition and not sos_done
+    sos_done := true
+    phase    := 7
+    if showLabels
+        label.new(bar_index[lookback], high[lookback], "SOS",
+                  color=c_sos, textcolor=color.white, style=label.style_label_down, size=size.normal)
+
+// ─── BU — Back-Up (to the Creek) ─────────────────────────────────────────────
+// Pullback to former resistance (creek) now acting as support, low volume
+buCondition = phase == 7 and not na(pivotLo) and
+              inRange(low[lookback], creekLevel, rangeBuffer * 4) and
+              volume[lookback] < volMA[lookback]
+
+if buCondition and not bu_done
+    bu_done := true
+    phase   := 8
+    if showLabels
+        label.new(bar_index[lookback], low[lookback], "BU",
+                  color=c_bu, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+// ─── Markup Continuation ─────────────────────────────────────────────────────
+// Price moves above creek + BU zone with strength
+muCondition = phase == 8 and not na(pivotHi) and
+              high[lookback] > creekLevel * (1 + rangeBuffer * 5) and
+              close[lookback] > open[lookback] and
+              volume[lookback] > volMA[lookback]
+
+if muCondition and not mu_done
+    mu_done := true
+    phase   := 9
+    if showLabels
+        label.new(bar_index[lookback], high[lookback], "Markup",
+                  color=c_mu, textcolor=color.black, style=label.style_label_down, size=size.normal)
+
+// ─── Background shading per phase ─────────────────────────────────────────────
+bgColor =
+      phase == 0 ? color.new(color.gray,   92) :
+      phase == 1 ? color.new(color.orange, 88) :
+      phase == 2 ? color.new(color.red,    88) :
+      phase == 3 ? color.new(color.yellow, 88) :
+      phase == 4 ? color.new(color.yellow, 85) :
+      phase == 5 ? color.new(color.purple, 85) :
+      phase == 6 ? color.new(color.teal,   85) :
+      phase == 7 ? color.new(color.green,  85) :
+      phase == 8 ? color.new(color.blue,   88) :
+      phase == 9 ? color.new(color.lime,   85) : na
+bgcolor(bgColor, title="Phase Background")
+
+// ─── Volume panel colouring ───────────────────────────────────────────────────
+volColor = isVolSpike ? color.new(color.red, 20) : color.new(color.gray, 40)
+plot(volume, "Volume", color=volColor, style=plot.style_columns)
+
+// ─── Status table ─────────────────────────────────────────────────────────────
+var table t = table.new(position.top_right, 2, 10, border_width=1,
+                         border_color=color.gray, frame_color=color.gray, frame_width=1)
+
+phaseNames = array.from("Watching", "PS", "SC", "AR", "ST", "Spring", "LPS", "SOS", "BU", "Markup")
+
+if barstate.islast
+    table.cell(t, 0, 0, "Wyckoff Phase", bgcolor=color.new(color.gray, 30), text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 0, array.get(phaseNames, phase), bgcolor=color.new(color.blue, 30), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 1, "PS",     text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 1, ps_done  ? "✓" : "–", bgcolor=ps_done  ? color.new(color.green,50) : color.new(color.gray,70), text_color=color.white, text_size=size.tiny)
+    table.cell(t, 0, 2, "SC",     text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 2, sc_done  ? "✓" : "–", bgcolor=sc_done  ? color.new(color.green,50) : color.new(color.gray,70), text_color=color.white, text_size=size.tiny)
+    table.cell(t, 0, 3, "AR",     text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 3, ar_done  ? "✓" : "–", bgcolor=ar_done  ? color.new(color.green,50) : color.new(color.gray,70), text_color=color.white, text_size=size.tiny)
+    table.cell(t, 0, 4, "ST",     text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 4, st_done  ? "✓" : "–", bgcolor=st_done  ? color.new(color.green,50) : color.new(color.gray,70), text_color=color.white, text_size=size.tiny)
+    table.cell(t, 0, 5, "Spring", text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 5, sp_done  ? "✓" : "–", bgcolor=sp_done  ? color.new(color.green,50) : color.new(color.gray,70), text_color=color.white, text_size=size.tiny)
+    table.cell(t, 0, 6, "LPS",    text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 6, lps_done ? "✓" : "–", bgcolor=lps_done ? color.new(color.green,50) : color.new(color.gray,70), text_color=color.white, text_size=size.tiny)
+    table.cell(t, 0, 7, "SOS",    text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 7, sos_done ? "✓" : "–", bgcolor=sos_done ? color.new(color.green,50) : color.new(color.gray,70), text_color=color.white, text_size=size.tiny)
+    table.cell(t, 0, 8, "BU",     text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 8, bu_done  ? "✓" : "–", bgcolor=bu_done  ? color.new(color.green,50) : color.new(color.gray,70), text_color=color.white, text_size=size.tiny)
+    table.cell(t, 0, 9, "Markup", text_color=color.white, text_size=size.tiny)
+    table.cell(t, 1, 9, mu_done  ? "✓" : "–", bgcolor=mu_done  ? color.new(color.green,50) : color.new(color.gray,70), text_color=color.white, text_size=size.tiny)
