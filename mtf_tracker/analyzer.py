@@ -213,6 +213,92 @@ class MTFAnalyzer:
             logger.warning("Broker data not available: %s", e)
             return pd.DataFrame()
 
+    # ── 11. Sector MTF Overlay ──
+
+    def sector_mtf_overlay(self) -> dict:
+        """Sector-level MTF concentration — maps directly to sector rotation signals.
+        High MTF in a sector = overweight risk in a correction.
+        """
+        try:
+            sectors = self.client.get_sector_breakdown()
+        except Exception as e:
+            logger.warning("Sector breakdown not available: %s", e)
+            return {"error": str(e), "sectors": []}
+
+        return {
+            "description": "Sector-level MTF book concentration",
+            "source": "margintradingfacility.com",
+            "data": sectors,
+        }
+
+    # ── 12. Danger Zone Screen ──
+
+    def danger_zone_screen(self, limit: int = 50) -> pd.DataFrame:
+        """Stocks where MTF book is rising but price is falling.
+        Investors averaging down on margin — eventual forced unwind amplifies decline.
+        """
+        try:
+            universe = self.client.get_stock_universe()
+        except Exception:
+            logger.warning("Stock universe not available for danger zone screen")
+            return pd.DataFrame()
+
+        if universe.empty:
+            return universe
+
+        change_col = _find_column(universe, ["change_30d", "change_1m", "30d_change", "book_change"])
+        price_col = _find_column(universe, ["price_change", "price_chg", "return_30d", "1m_return"])
+
+        if change_col and price_col:
+            universe[change_col] = pd.to_numeric(universe[change_col], errors="coerce")
+            universe[price_col] = pd.to_numeric(universe[price_col], errors="coerce")
+            danger = universe[
+                (universe[change_col] > 0) & (universe[price_col] < 0)
+            ].copy()
+            danger["divergence"] = danger[change_col] - danger[price_col]
+            return danger.sort_values("divergence", ascending=False).head(limit)
+
+        book_col = _find_column(universe, ["book", "mtf_book", "outstanding", "amount"])
+        if book_col:
+            return universe.sort_values(book_col, ascending=False).head(limit)
+
+        return universe.head(limit)
+
+    # ── 13. Non-F&O Concentration ──
+
+    def non_fno_concentration(self, limit: int = 50) -> pd.DataFrame:
+        """Non-F&O stocks ranked by MTF book as % of free float.
+        These cannot be hedged and freeze in lower circuits during sell-offs — pure tail risk.
+        """
+        try:
+            universe = self.client.get_stock_universe()
+        except Exception:
+            logger.warning("Stock universe not available for non-F&O concentration")
+            return pd.DataFrame()
+
+        if universe.empty:
+            return universe
+
+        fno_col = _find_column(universe, ["fno", "f_o", "fo_class", "class", "category", "type"])
+        ff_col = _find_column(universe, ["pct_free_float", "ff_pct", "leverage_pct", "leverage"])
+        book_col = _find_column(universe, ["book", "mtf_book", "outstanding", "amount"])
+
+        if not fno_col:
+            if book_col:
+                return universe.sort_values(book_col, ascending=False).head(limit)
+            return universe.head(limit)
+
+        non_fno = universe[
+            ~universe[fno_col].astype(str).str.upper().isin(["F&O", "FNO", "FO", "YES", "TRUE"])
+        ].copy()
+
+        sort_col = ff_col or book_col
+        if sort_col:
+            non_fno[sort_col] = pd.to_numeric(non_fno[sort_col], errors="coerce")
+            return non_fno.sort_values(sort_col, ascending=False).head(limit)
+
+        return non_fno.head(limit)
+
     # ── Composite Risk Score ──
 
     def compute_risk_score(self, ticker: str) -> dict:

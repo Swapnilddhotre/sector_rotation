@@ -37,6 +37,9 @@ Run from the repo root: `python -m mtf_tracker.cli <command>`
 | `crowding --min-dtc 5` | Stocks hardest to unwind (highest days-to-cover) |
 | `risk-scan --limit 50` | Non-F&O stocks with high leverage (unhedgeable risk) |
 | `flush --threshold -10` | Detect forced selling / margin call liquidations |
+| `sectors` | Sector-level MTF concentration (maps to sector rotation) |
+| `danger-zone --limit 50` | Stocks with rising MTF book + falling price (margin averaging down) |
+| `non-fno --limit 50` | Non-F&O stocks ranked by MTF/free-float (unhedgeable tail risk) |
 
 ### Single-Stock Analysis
 
@@ -53,6 +56,8 @@ Run from the repo root: `python -m mtf_tracker.cli <command>`
 GET /api/latest              → whole-market overview
 GET /api/stocks?limit=50     → top funded stocks with 7D/30D changes
 GET /api/stock/{TICKER}      → single-stock detail + 3-month price-vs-book
+GET /api/sectors             → sector-level MTF aggregation & breakdown
+GET /api/openapi.json        → OpenAPI spec — full endpoint documentation
 ```
 
 ### mtf.trading (richer datasets — CSV/JSON)
@@ -67,6 +72,10 @@ GET /data/broker-history.csv   → per-broker MTF book history
 GET /{YYYY-MM-DD}/.json        → full daily snapshot (any day since June 2017)
 GET /feed.xml                  → Atom feed of daily book
 GET /events.xml                → threshold alerts, milestones, flushes
+GET /api/v1/summary            → market summary JSON (REST API v1)
+GET /api/v1/brokers            → broker-level data JSON
+GET /api/v1/global             → global MTF metrics JSON
+GET /api/v1/bhavcopy           → MTF-enriched bhavcopy data
 ```
 
 ## Key Metrics Glossary
@@ -142,6 +151,21 @@ snapshot = client.get_daily_snapshot("2026-10-22")
 
 # Full stock universe (~3,400 stocks)
 universe = client.get_stock_universe()
+
+# Sector-level MTF overlay (plugs into sector rotation)
+sectors = analyzer.sector_mtf_overlay()
+
+# Danger zone: rising MTF + falling price
+danger = analyzer.danger_zone_screen(limit=50)
+
+# Non-F&O concentration (unhedgeable tail risk)
+tail_risk = analyzer.non_fno_concentration(limit=50)
+
+# Sector breakdown (raw API)
+sector_data = client.get_sector_breakdown()
+
+# MTF-enriched bhavcopy
+bhavcopy = client.get_mtf_bhavcopy()
 ```
 
 ## Network Requirements

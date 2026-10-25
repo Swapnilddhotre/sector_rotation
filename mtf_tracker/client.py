@@ -145,6 +145,34 @@ class MTFClient:
         url = f"{API_FEED}/data/broker-history.csv"
         return self._get_csv(url, "broker_history")
 
+    # ── margintradingfacility.com — newly discovered endpoints ──
+
+    def get_sector_breakdown(self) -> dict:
+        """Sector-level MTF aggregation: book size, change, stock count per sector."""
+        return self._get(f"{API_PRIMARY}/sectors", "sector_breakdown")
+
+    def get_openapi_spec(self) -> dict:
+        """OpenAPI spec for margintradingfacility.com — auto-discover endpoints & field schemas."""
+        return self._get(f"{API_PRIMARY}/openapi.json", "openapi_spec")
+
+    # ── mtf.trading REST API v1 ──
+
+    def get_market_summary_v1(self) -> dict:
+        """Market summary from mtf.trading REST API v1 — richer field set than CSV."""
+        return self._get(f"{API_FEED}/api/v1/summary", "v1_summary")
+
+    def get_broker_data_v1(self) -> dict:
+        """Broker-level MTF data as JSON (alternative to CSV broker-history)."""
+        return self._get(f"{API_FEED}/api/v1/brokers", "v1_brokers")
+
+    def get_global_metrics(self) -> dict:
+        """Global MTF metrics from mtf.trading REST API v1."""
+        return self._get(f"{API_FEED}/api/v1/global", "v1_global")
+
+    def get_mtf_bhavcopy(self) -> dict:
+        """MTF-enriched bhavcopy data — end-of-day prices with MTF overlay."""
+        return self._get(f"{API_FEED}/api/v1/bhavcopy", "v1_bhavcopy")
+
     # ── NSE Direct (raw exchange files) ──
 
     def get_nse_mtf_daily(self, date: str) -> pd.DataFrame:

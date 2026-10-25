@@ -153,6 +153,33 @@ def cmd_brokers(analyzer: MTFAnalyzer, args):
         print(df.to_string(index=False))
 
 
+def cmd_sectors(analyzer: MTFAnalyzer, args):
+    result = analyzer.sector_mtf_overlay()
+    print("\nSECTOR-LEVEL MTF CONCENTRATION")
+    print("=" * 60)
+    print(fmt_json(result))
+
+
+def cmd_danger_zone(analyzer: MTFAnalyzer, args):
+    df = analyzer.danger_zone_screen(limit=args.limit)
+    print(f"\nDANGER ZONE — MTF Rising + Price Falling (top {args.limit})")
+    print("-" * 60)
+    if df.empty:
+        print("No data available (or price change column not found in dataset)")
+    else:
+        print(df.to_string(index=False))
+
+
+def cmd_non_fno(analyzer: MTFAnalyzer, args):
+    df = analyzer.non_fno_concentration(limit=args.limit)
+    print(f"\nNON-F&O MTF CONCENTRATION — Unhedgeable Tail Risk (top {args.limit})")
+    print("-" * 60)
+    if df.empty:
+        print("No data available")
+    else:
+        print(df.to_string(index=False))
+
+
 def cmd_snapshot(analyzer: MTFAnalyzer, args):
     date = args.date or datetime.now().strftime("%Y-%m-%d")
     try:
@@ -202,6 +229,14 @@ def main():
 
     sub.add_parser("brokers", help="Broker-level MTF analysis")
 
+    sub.add_parser("sectors", help="Sector-level MTF concentration")
+
+    p = sub.add_parser("danger-zone", help="Stocks with rising MTF + falling price")
+    p.add_argument("--limit", type=int, default=50)
+
+    p = sub.add_parser("non-fno", help="Non-F&O stocks by MTF concentration")
+    p.add_argument("--limit", type=int, default=50)
+
     p = sub.add_parser("snapshot", help="Daily snapshot for a specific date")
     p.add_argument("--date", help="YYYY-MM-DD (default: today)")
 
@@ -223,6 +258,9 @@ def main():
         "breadth": cmd_breadth,
         "composition": cmd_composition,
         "brokers": cmd_brokers,
+        "sectors": cmd_sectors,
+        "danger-zone": cmd_danger_zone,
+        "non-fno": cmd_non_fno,
         "snapshot": cmd_snapshot,
     }
     commands[args.command](analyzer, args)
